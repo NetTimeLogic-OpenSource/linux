@@ -1,0 +1,10 @@
+#
+# NetTimeLogic PHC device configuration
+#
+
+config NTL_PHC
+	bool "NetTimeLogic PHC devices"
+	depends on HAS_IOMEM
+	default y
+	help
+	  If you have a Adjustable Counter Clock IP in the PL.

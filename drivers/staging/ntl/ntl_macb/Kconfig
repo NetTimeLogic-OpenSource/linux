@@ -1,0 +1,23 @@
+#
+# NetTimeLogic MAC/TSU device configuration
+#
+
+config NTL_MACB
+	tristate "Cadence MACB/GEM support (NTL version)"
+	depends on HAS_DMA
+	select PHYLIB
+	help
+	  The Cadence MACB ethernet interface is found on many Atmel AT32 and
+	  AT91 parts.  This driver also supports the Cadence GEM (Gigabit
+	  Ethernet MAC found in some ARM SoC devices).  Say Y to include
+	  support for the MACB/GEM chip.
+
+	  To compile this driver as a module, choose M here: the module
+	  will be macb.
+
+config NTL_TSU
+	tristate "NetTimeLogic TSU"
+	depends on HAS_IOMEM && NTL_MACB
+	help
+	  The Cadence MACB is configured to get the timestamps from the TSU 
+	  in the PL rather than from the MAC.
