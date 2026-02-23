@@ -2951,7 +2951,9 @@ static int ntl_macb_get_ts_info(struct net_device *netdev,
 		SOF_TIMESTAMPING_RAW_HARDWARE;
 	info->tx_types =
 		(1 << HWTSTAMP_TX_OFF) |
-		(1 << HWTSTAMP_TX_ON);
+		(1 << HWTSTAMP_TX_ON) |
+		(1 << HWTSTAMP_TX_ONESTEP_SYNC) |
+		(1 << HWTSTAMP_TX_ONESTEP_P2P);
 	info->rx_filters =
 		(1 << HWTSTAMP_FILTER_NONE) |
 		(1 << HWTSTAMP_FILTER_ALL);
@@ -3301,7 +3303,9 @@ static int gem_set_hwtst(struct net_device *dev,
 		return -EINVAL;
 
 	if ((config.tx_type != HWTSTAMP_TX_OFF) &&
-	    (config.tx_type != HWTSTAMP_TX_ON))
+	    (config.tx_type != HWTSTAMP_TX_ON) &&
+	    (config.tx_type != HWTSTAMP_TX_ONESTEP_SYNC) &&
+	    (config.tx_type != HWTSTAMP_TX_ONESTEP_P2P))
 		return -ERANGE;
 
 	switch (config.rx_filter) {
@@ -3328,9 +3332,8 @@ static int gem_set_hwtst(struct net_device *dev,
 
 #ifdef CONFIG_NTL_TSU
 	ntl_tsu_clear_alltstamp(&bp->tsu);
+	bp->tsu.tx_type = config.tx_type;
 #endif
-
-	config.tx_type = HWTSTAMP_TX_ON;
 
 	return copy_to_user(ifr->ifr_data, &config, sizeof(config)) ?
 		-EFAULT : 0;

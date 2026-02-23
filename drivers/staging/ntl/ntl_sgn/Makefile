@@ -1,0 +1,1 @@
+obj-$(CONFIG_NTL_SGN) += ntl_sgn.o

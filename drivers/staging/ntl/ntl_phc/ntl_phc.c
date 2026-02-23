@@ -528,7 +528,7 @@ static int ntl_phc_probe(struct platform_device *pdev)
         goto err_platform_get_resource_failed;
     }  
 
-    printk(KERN_ERR "%s ctrl_mem@0x%08X - 0x%08X\n", NTL_PHC_DRIVER_NAME, mem->start, (mem->start + NTL_PHC_REGSET_SIZE -1));
+    printk(KERN_ERR "%s ctrl_mem@0x%016llX - 0x%016llX\n", NTL_PHC_DRIVER_NAME, (unsigned long long)mem->start, (unsigned long long)(mem->start + NTL_PHC_REGSET_SIZE -1));
 
     // save physical address
     phc->physical_ctrl_base = mem->start;
@@ -666,6 +666,7 @@ static int ntl_phc_remove(struct platform_device *pdev)
 /*****************************************************************************/
 static struct of_device_id ntl_phc_of_match[] = {
     { .compatible = "ntl,ntl_phc", },
+    { .compatible = "ntl_phc", },
     { /* end of list */ }
 };
 

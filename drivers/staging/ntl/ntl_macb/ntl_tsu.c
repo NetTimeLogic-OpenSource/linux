@@ -66,9 +66,11 @@ const uint8_t NTL_TSU_PTP_PDELAYDSTIPV6[]           = {0xFF, 0x02, 0x00, 0x00, 0
 #define NTL_TSU_UDP                                 0x11
 #define NTL_TSU_UDP_EVENT_PORT                      0x013F
 #define NTL_TSU_UDP_GENERAL_PORT                    0x0140
+#define NTL_TSU_UDP_NTP_PORT                        0x007B
 #define NTL_TSU_UDP_SCION_PORT                      0x7559
 #define NTL_TSU_UDP_SCION_EVENT_PORT                0x284F
 #define NTL_TSU_UDP_SCION_GENERAL_PORT              0x2850
+#define NTL_TSU_UDP_SCION_NTP_PORT                  0x278B
 
 #define NTL_TSU_PTP_VERSION                         0x02
 
@@ -82,6 +84,9 @@ const uint8_t NTL_TSU_PTP_PDELAYDSTIPV6[]           = {0xFF, 0x02, 0x00, 0x00, 0
 #define NTL_TSU_PTP_MSG_ANNOUNCE                    0x0B
 #define NTL_TSU_PTP_MSG_SIGNALING                   0x0C
 #define NTL_TSU_PTP_MSG_MANAGEMENT                  0x0D
+#define NTL_TSU_PTP_MSG_RESERVED_E                  0x0E
+#define NTL_TSU_PTP_MSG_RESERVED_F                  0x0F
+#define NTL_TSU_NTP_MSG                             0x10
 
 #define NTL_TSU_PTP_FLAG_TWO_STEP                   0x0200
 
@@ -148,6 +153,9 @@ static int ntl_tsu_parse_frame(struct sk_buff* skb, uint8_t direction, struct nt
 {
 
     uint32_t offset;
+#ifdef NTL_TSU_NTP_SUPPORT
+    uint8_t ntp_clock_id[8];
+#endif
 #ifdef NTL_TSU_CHECK_MAC_TX
     uint8_t dst_mac[6];
 #endif
@@ -185,7 +193,6 @@ static int ntl_tsu_parse_frame(struct sk_buff* skb, uint8_t direction, struct nt
     else if (direction == NTL_TSU_RX)
     {
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "RX FRAME\n");
-
         if (NTL_TSU_PTP_ETHERTYPE == ntohs(skb->protocol))
         {
             NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "PROTOCOL PTP\n");
@@ -319,6 +326,20 @@ check_ethertype:
 // check ipv4 version, protocol and destination ip
 check_ip_v4:
     layer = NTL_TSU_LAYER_IPv4;
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    memcpy(&(ntp_clock_id[0]), (skb->data + offset + 4), 2); // IP ID
+    memcpy(&(ntp_clock_id[2]), (skb->data + offset + 10), 2); // IP Header Checksum
+    if (direction == NTL_TSU_TX)
+    {
+        memcpy(&(ntp_clock_id[4]), (skb->data + offset + 16), 4); // DST IP
+    }
+    else
+    {
+        memcpy(&(ntp_clock_id[4]), (skb->data + offset + 12), 4); // SRC IP
+    }
+#endif
+
     memcpy(&header_ip, (skb->data + offset + 0), sizeof(header_ip)); // this is where the version and header length is
     if ((header_ip & 0xF0) != NTL_TSU_IPv4_VERSION) // not ip v4
     {
@@ -328,7 +349,7 @@ check_ip_v4:
 
     header_length = (header_ip & 0x0F);
     header_length *= 4; // header is in 32 bits
-    
+
     NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "IP HEADER LENGTH %d\n", header_length);
 
     memcpy(&protocol_ip, (skb->data + offset + 9), sizeof(protocol_ip)); // this is where the protocol is
@@ -364,6 +385,18 @@ check_ip_v4:
 // check ipv6 version, protocol and destination ip
 check_ip_v6:
     layer = NTL_TSU_LAYER_IPv6;
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (direction == NTL_TSU_TX)
+    {
+        memcpy(ntp_clock_id, (skb->data + offset + 32), 8); // DST IP (lower 64bits)
+    }
+    else
+    {
+        memcpy(ntp_clock_id, (skb->data + offset + 16), 8); // SRC IP (lower 64bits)
+    }
+#endif
+
     memcpy(&header_ip, (skb->data + offset + 0), sizeof(header_ip)); // this is where the version is
     if ((header_ip & 0xF0) != NTL_TSU_IPv6_VERSION) // not ip v6
     {
@@ -413,6 +446,18 @@ check_ip_v6:
 // check scion and skip header
 check_scion:
     layer = NTL_TSU_LAYER_SCION;
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (direction == NTL_TSU_TX)
+    {
+        memcpy(ntp_clock_id, (skb->data + offset + 12), 8); // DST ISD & AS
+    }
+    else
+    {
+        memcpy(ntp_clock_id, (skb->data + offset + 20), 8); // SRC ISD & AS
+    }
+#endif
+
     memcpy(&protocol_scion, (skb->data + offset + 4), sizeof(protocol_scion)); // this is where the protocol is
     if (protocol_scion  != NTL_TSU_UDP) // not udp
     {
@@ -424,12 +469,12 @@ check_scion:
 
     header_length = header_scion;
     header_length *= 4; // header is in 32 bits
-    
+
     NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "SCION HEADER LENGTH %d\n", header_length);
-    
+
     offset += header_length; // go to udp header
     NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "DID NOT CHECK SCION\n");
-    
+
     if (offset > skb->data_len)
     {
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "SCION HEADER LENGTH WRONG?\n");
@@ -444,28 +489,41 @@ check_scion:
 check_udp:
     memcpy(&port_udp_src, (skb->data + offset + 0), sizeof(port_udp_src)); // this is where the source port is
     port_udp_src = ntohs(port_udp_src);
-    
+
     memcpy(&port_udp_dst, (skb->data + offset + 2), sizeof(port_udp_dst)); // this is where the destination port is
     port_udp_dst = ntohs(port_udp_dst);
 
-    if (port_udp_dst == NTL_TSU_UDP_EVENT_PORT) // event message
+    if ((port_udp_src == NTL_TSU_UDP_EVENT_PORT) ||
+        (port_udp_dst == NTL_TSU_UDP_EVENT_PORT)) // event message
     {
         offset += 8; // go to ptp header
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "PTP UDP EVENT PORT\n");
         goto check_ptp;
     }
-    else if (port_udp_dst == NTL_TSU_UDP_GENERAL_PORT) // no event message
+    else if ((port_udp_src == NTL_TSU_UDP_GENERAL_PORT) ||
+             (port_udp_dst == NTL_TSU_UDP_GENERAL_PORT)) // no event message
     {
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "PTP UDP GENERAL PORT, not to ts\n");
         goto skip_ts;
     }
+#ifdef NTL_TSU_NTP_SUPPORT
+    else if ((port_udp_src == NTL_TSU_UDP_NTP_PORT) ||
+             (port_udp_dst == NTL_TSU_UDP_NTP_PORT)) // ntp message
+    {
+        offset += 8; // go to ntp header
+        NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "NTP UDP PORT\n");
+        goto check_ntp;
+    }
+#endif
     else if ((layer != NTL_TSU_LAYER_SCION) &&
              ((port_udp_src == NTL_TSU_UDP_SCION_PORT) ||
               (port_udp_src == NTL_TSU_UDP_SCION_EVENT_PORT) ||
               (port_udp_src == NTL_TSU_UDP_SCION_GENERAL_PORT) ||
+              (port_udp_src == NTL_TSU_UDP_SCION_NTP_PORT) ||
               (port_udp_dst == NTL_TSU_UDP_SCION_PORT) ||
               (port_udp_dst == NTL_TSU_UDP_SCION_EVENT_PORT) ||
-              (port_udp_dst == NTL_TSU_UDP_SCION_GENERAL_PORT))) // scion ports and outer
+              (port_udp_dst == NTL_TSU_UDP_SCION_GENERAL_PORT) ||
+              (port_udp_dst == NTL_TSU_UDP_SCION_NTP_PORT))) // scion ports and outer
     {
         offset += 8; // go to scion header
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "SCION UDP PORT\n");
@@ -486,6 +544,16 @@ check_udp:
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "PTP SCION UDP GENERAL PORT, not to ts\n");
         goto skip_ts;
     }
+#ifdef NTL_TSU_NTP_SUPPORT
+    else if ((layer = NTL_TSU_LAYER_SCION) &&
+             ((port_udp_src == NTL_TSU_UDP_SCION_NTP_PORT) ||
+              (port_udp_dst == NTL_TSU_UDP_SCION_NTP_PORT))) // scion NTP ports and inner
+    {
+        offset += 8; // go to ntp header
+        NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "NTP SCION UDP PORT\n");
+        goto check_ntp;
+    }
+#endif
     else
     {
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "UNKNOWN UDP PORT but with PTP IP: %04x\n", port_udp_dst);
@@ -537,6 +605,20 @@ check_ptp:
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "PTP FRAME not to TS\n");
         goto skip_ts;
     }
+
+#ifdef NTL_TSU_NTP_SUPPORT
+// check and extract some info from the frame
+check_ntp:
+    ptp_msg_type = NTL_TSU_NTP_MSG;
+    memcpy(&(meta_info->domain_number), (skb->data + offset + 0), sizeof(meta_info->domain_number));
+    meta_info->domain_number &= 0x3F; // we use the Version and Mode as Domain
+    memcpy(&(meta_info->clock_identity), ntp_clock_id, sizeof(meta_info->clock_identity)); // might be parts of IPv4, IPv6 or Scion Header
+    memcpy(&(meta_info->port_number), (skb->data + offset + 28), sizeof(meta_info->port_number)); // upper part of lower 32bits of the Origin Timestamp
+    meta_info->port_number = ntohs(meta_info->port_number);
+    memcpy(&(meta_info->sequence_identity), (skb->data + offset + 30), sizeof(meta_info->sequence_identity)); // lower part of lower 32bits of the Origin Timestamp
+    meta_info->sequence_identity = ntohs(meta_info->sequence_identity);
+    goto get_ts;
+#endif
 
 skip_ts:
     *skip = 1;
@@ -748,7 +830,7 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
     //start_time = jiffies + usecs_to_jiffies(NTL_TSU_RX_TS_TIMEOUT_MICROSECOND);
     start_time = ktime_get();
-    
+
     if (ptp_msg_type >= 0)
     {
         do
@@ -799,7 +881,7 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "delay req rx timestamp\n");
@@ -864,7 +946,7 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "pdelay req rx timestamp\n");
@@ -929,7 +1011,7 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "pdelay resp rx timestamp\n");
@@ -994,7 +1076,7 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "sync rx timestamp\n");
@@ -1018,6 +1100,81 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 #endif
                     break;
 
+#ifdef NTL_TSU_NTP_SUPPORT
+                case NTL_TSU_NTP_MSG:
+                    if (tsu->ntp_support != 0)
+                    {
+                        // start spinlock section
+                        spin_lock_irqsave(&(tsu->lock), flags);
+
+#ifdef NTL_TSU_META_INFO
+                        if (tsu->meta_mode != 0)
+                        {
+#ifdef NTL_TSU_IRQ_MODE_RX
+                            if (tsu->irq_mode != 0)
+                            {
+                                //nothing
+                            }
+                            else
+#endif
+                            {
+                                // read all timestamps
+                                delta_time_us = 0; // ensure at least one read
+                                while ((0 < ntl_tsu_get_timestamp_and_meta_info(tsu, NTL_TSU_TS_STATUS_NTP_RX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_RX_BIT, NTL_TSU_NTP_RX_L_REG, NTL_TSU_NTP_RX_H_REG, &second, &nanosecond,
+                                                                                     NTL_TSU_META_NTP_RX_0_REG, NTL_TSU_META_NTP_RX_1_REG, NTL_TSU_META_NTP_RX_2_REG, NTL_TSU_META_NTP_RX_3_REG, &meta_info_ts)) &&
+                                       (delta_time_us < NTL_TSU_RX_TS_TIMEOUT_MICROSECOND))
+                                {
+                                    // add to the front of the queue
+                                    ret = ntl_tsu_push_timestamp(tsu, &(tsu->data_queue_ntp_rx), &(tsu->data_queue_entry_count_ntp_rx), &meta_info_ts, &second, &nanosecond);
+
+                                    now_time = ktime_get();
+                                    delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+                                }
+                            }
+                            ret = ntl_tsu_find_timestamp(tsu, &(tsu->data_queue_ntp_rx), &(tsu->data_queue_entry_count_ntp_rx), &meta_info, &second, &nanosecond);
+                        }
+                        else
+#endif
+                        {
+                            ret = ntl_tsu_get_timestamp(tsu, NTL_TSU_TS_STATUS_NTP_RX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_RX_BIT, NTL_TSU_NTP_RX_L_REG, NTL_TSU_NTP_RX_H_REG, &second, &nanosecond);
+                        }
+
+                        // end spinlock section
+                        spin_unlock_irqrestore(&(tsu->lock), flags);
+
+                        now_time = ktime_get();
+                        delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+
+                        if (ret > 0)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "ntp rx timestamp\n");
+                            goto return_rx_ts;
+                        }
+                        if (ret < 0)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_ERROR_LEVEL, "ntp rx timestamp error\n");
+                            goto return_no_rx_ts;
+                        }
+                        else if (delta_time_us >= NTL_TSU_RX_TS_TIMEOUT_MICROSECOND)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "no ntp rx timestamp\n");
+                        }
+#ifdef NTL_TSU_IRQ_MODE_RX
+                        else if ((tsu->irq_mode != 0) && (ret == 0))
+                        {
+                            // wait that someone wakes us up (or timeout, one 10th of the complete timeout)
+                            wait_event_interruptible_timeout(tsu->wait_queue_ntp_rx, (0 == list_empty(&(tsu->data_queue_ntp_rx))), usecs_to_jiffies(NTL_TSU_RX_TS_TIMEOUT_MICROSECOND/10));
+                        }
+#endif
+                    }
+                    else
+                    {
+                        NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "not NTP support\n");
+                        goto return_no_rx_ts;
+                    }
+                    break;
+#endif
+
                 default:
                     NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "not supported rx message type\n");
                     goto return_no_rx_ts;
@@ -1027,11 +1184,18 @@ void ntl_tsu_handle_rxtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-            
+
         } while ((delta_time_us < NTL_TSU_RX_TS_TIMEOUT_MICROSECOND));
 
         NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "waiting for rx timestamp timed out\n");
     }
+#ifdef NTL_TSU_NON_TSU_TS
+    else
+    {
+        // no timestamp modification (software timestamp still intact?)
+        return;
+    }
+#endif
 
 return_no_rx_ts:
     // default no timestamp
@@ -1080,7 +1244,7 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
     //start_time = jiffies + usecs_to_jiffies(NTL_TSU_TX_TS_TIMEOUT_MICROSECOND);
     start_time = ktime_get();
-    
+
     if (ptp_msg_type >= 0)
     {
         do
@@ -1131,7 +1295,7 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "delay req tx timestamp\n");
@@ -1196,7 +1360,7 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "pdelay req tx timestamp\n");
@@ -1261,7 +1425,7 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "pdelay resp tx timestamp\n");
@@ -1326,7 +1490,7 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
                     now_time = ktime_get();
                     delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-                    
+
                     if (ret > 0)
                     {
                         NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "sync tx timestamp\n");
@@ -1350,6 +1514,81 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 #endif
                     break;
 
+#ifdef NTL_TSU_NTP_SUPPORT
+                case NTL_TSU_NTP_MSG:
+                    if (tsu->ntp_support != 0)
+                    {
+                        // start spinlock section
+                        spin_lock_irqsave(&(tsu->lock), flags);
+
+#ifdef NTL_TSU_META_INFO
+                        if (tsu->meta_mode != 0)
+                        {
+#ifdef NTL_TSU_IRQ_MODE_TX
+                            if (tsu->irq_mode != 0)
+                            {
+                                //nothing
+                            }
+                            else
+#endif
+                            {
+                                // read all timestamps
+                                delta_time_us = 0; // ensure at least one read
+                                while ((0 < ntl_tsu_get_timestamp_and_meta_info(tsu, NTL_TSU_TS_STATUS_NTP_TX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_TX_BIT, NTL_TSU_NTP_TX_L_REG, NTL_TSU_NTP_TX_H_REG, &second, &nanosecond,
+                                                                                     NTL_TSU_META_NTP_TX_0_REG, NTL_TSU_META_NTP_TX_1_REG, NTL_TSU_META_NTP_TX_2_REG, NTL_TSU_META_NTP_TX_3_REG, &meta_info_ts)) &&
+                                       (delta_time_us < NTL_TSU_TX_TS_TIMEOUT_MICROSECOND))
+                                {
+                                    // add to the front of the queue
+                                    ret = ntl_tsu_push_timestamp(tsu, &(tsu->data_queue_ntp_tx), &(tsu->data_queue_entry_count_ntp_tx), &meta_info_ts, &second, &nanosecond);
+
+                                    now_time = ktime_get();
+                                    delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+                                }
+                            }
+                            ret = ntl_tsu_find_timestamp(tsu, &(tsu->data_queue_ntp_tx), &(tsu->data_queue_entry_count_ntp_tx), &meta_info, &second, &nanosecond);
+                        }
+                        else
+#endif
+                        {
+                            ret = ntl_tsu_get_timestamp(tsu, NTL_TSU_TS_STATUS_NTP_TX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_TX_BIT, NTL_TSU_NTP_TX_L_REG, NTL_TSU_NTP_TX_H_REG, &second, &nanosecond);
+                        }
+
+                        // end spinlock section
+                        spin_unlock_irqrestore(&(tsu->lock), flags);
+
+                        now_time = ktime_get();
+                        delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+
+                        if (ret > 0)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_INFO_LEVEL, "ntp tx timestamp\n");
+                            goto return_tx_ts;
+                        }
+                        if (ret < 0)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_ERROR_LEVEL, "ntp tx timestamp error\n");
+                            goto return_no_tx_ts;
+                        }
+                        else if (delta_time_us >= NTL_TSU_TX_TS_TIMEOUT_MICROSECOND)
+                        {
+                            NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "no ntp tx timestamp\n");
+                        }
+#ifdef NTL_TSU_IRQ_MODE_TX
+                        else if ((tsu->irq_mode != 0) && (ret == 0))
+                        {
+                            // wait that someone wakes us up (or timeout, one 10th of the complete timeout)
+                            wait_event_interruptible_timeout(tsu->wait_queue_ntp_tx, (0 == list_empty(&(tsu->data_queue_ntp_tx))), usecs_to_jiffies(NTL_TSU_TX_TS_TIMEOUT_MICROSECOND/10));
+                        }
+#endif
+                    }
+                    else
+                    {
+                        NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "not NTP support\n");
+                        goto return_no_tx_ts;
+                    }
+                    break;
+#endif
+
                 default:
                     NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "not supported tx message type\n");
                     goto return_no_tx_ts;
@@ -1359,23 +1598,31 @@ void ntl_tsu_handle_txtstamp(struct ntl_tsu* tsu, struct sk_buff *skb)
 
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
-            
+
         } while ((delta_time_us < NTL_TSU_TX_TS_TIMEOUT_MICROSECOND));
 
         NTL_TSU_DPRINTK(NTL_TSU_WARNING_LEVEL, "waiting for tx timestamp timed out\n");
     }
+#ifdef NTL_TSU_NON_TSU_TS
+    else
+    {
+        // this should create a software timestamp
+        skb_tstamp_tx(skb, NULL); 
+        return;
+    }
+#endif
 
 return_no_tx_ts:
     // default no timestamp
     second = 0;
     nanosecond = 0;
-    return; // don't feed to the network stack
+    return; // don't feed to the network stack, we should have a timestamp but don't
 
 return_tx_ts:
-    if (skip != 0)
+    if (skip != 0 && tsu->tx_type != HWTSTAMP_TX_ON)
     {
         NTL_TSU_DPRINTK(NTL_TSU_DEBUG_LEVEL, "skipping to feed timestamp to network stack (one-step)\n");
-        return; // don't feed to the network stack
+        return; // don't feed to the network stack since ptp4l was not expecting a timestamp in this case
     }
 
     timestamps = skb_hwtstamps(skb);
@@ -1423,6 +1670,10 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
                NTL_TSU_TS_STATUS_PDELAY_RESP_TX_ERROR_BIT | NTL_TSU_TS_STATUS_PDELAY_RESP_TX_BIT |
                NTL_TSU_TS_STATUS_SYNC_RX_ERROR_BIT | NTL_TSU_TS_STATUS_SYNC_RX_BIT |
                NTL_TSU_TS_STATUS_SYNC_TX_ERROR_BIT | NTL_TSU_TS_STATUS_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+    reg_data |= NTL_TSU_TS_STATUS_NTP_RX_ERROR_BIT | NTL_TSU_TS_STATUS_NTP_RX_BIT |
+                NTL_TSU_TS_STATUS_NTP_TX_ERROR_BIT | NTL_TSU_TS_STATUS_NTP_TX_BIT;
+#endif
 
     // write ts status register
     ntl_tsu_write_reg(tsu, NTL_TSU_TS_STATUS_REG, &reg_data);
@@ -1448,6 +1699,10 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
                    NTL_TSU_TS_IRQ_PDELAY_RESP_TX_BIT |
                    NTL_TSU_TS_IRQ_SYNC_RX_BIT |
                    NTL_TSU_TS_IRQ_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+        reg_data |= NTL_TSU_TS_IRQ_NTP_RX_BIT |
+                    NTL_TSU_TS_IRQ_NTP_TX_BIT;
+#endif
 
         // write irq register
         ntl_tsu_write_reg(tsu, NTL_TSU_TS_IRQ_REG, &reg_data);
@@ -1504,15 +1759,36 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
             kfree(timestamp);
         }
 
+#ifdef NTL_TSU_NTP_SUPPORT
+        while (0 == list_empty(&(tsu->data_queue_ntp_rx)))
+        {
+            timestamp = list_entry(tsu->data_queue_ntp_rx.next, struct ntl_tsu_timestamp_list, list);
+            list_del(tsu->data_queue_ntp_rx.next);
+            kfree(timestamp);
+        }
+        while (0 == list_empty(&(tsu->data_queue_ntp_tx)))
+        {
+            timestamp = list_entry(tsu->data_queue_ntp_tx.next, struct ntl_tsu_timestamp_list, list);
+            list_del(tsu->data_queue_ntp_tx.next);
+            kfree(timestamp);
+        }
+#endif
+
         // set to empty
         atomic_set(&(tsu->data_queue_entry_count_delay_req_rx), 0);
         atomic_set(&(tsu->data_queue_entry_count_pdelay_req_rx), 0);
         atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_rx), 0);
         atomic_set(&(tsu->data_queue_entry_count_sync_rx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+        atomic_set(&(tsu->data_queue_entry_count_ntp_rx), 0);
+#endif
         atomic_set(&(tsu->data_queue_entry_count_delay_req_tx), 0);
         atomic_set(&(tsu->data_queue_entry_count_pdelay_req_tx), 0);
         atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_tx), 0);
         atomic_set(&(tsu->data_queue_entry_count_sync_tx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+        atomic_set(&(tsu->data_queue_entry_count_ntp_tx), 0);
+#endif
 
 #endif
 
@@ -1526,6 +1802,12 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
                     NTL_TSU_TS_IRQMASK_PDELAY_REQ_RX_BIT |
                     NTL_TSU_TS_IRQMASK_PDELAY_RESP_RX_BIT |
                     NTL_TSU_TS_IRQMASK_SYNC_RX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_IRQMASK_NTP_RX_BIT;
+    }
+#endif
 #endif
 
 #ifdef NTL_TSU_IRQ_MODE_TX
@@ -1534,6 +1816,12 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
                     NTL_TSU_TS_IRQMASK_PDELAY_REQ_TX_BIT |
                     NTL_TSU_TS_IRQMASK_PDELAY_RESP_TX_BIT |
                     NTL_TSU_TS_IRQMASK_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_IRQMASK_NTP_TX_BIT;
+    }
+#endif
 #endif
 
         // write irq mask register
@@ -1553,7 +1841,13 @@ void ntl_tsu_clear_alltstamp(struct ntl_tsu* tsu)
                NTL_TSU_TS_CONTROL_PDELAY_RESP_TX_BIT |
                NTL_TSU_TS_CONTROL_SYNC_RX_BIT |
                NTL_TSU_TS_CONTROL_SYNC_TX_BIT;
-
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_CONTROL_NTP_RX_BIT |
+                    NTL_TSU_TS_CONTROL_NTP_TX_BIT;
+    }
+#endif
 
     // write ts control register
     ntl_tsu_write_reg(tsu, NTL_TSU_TS_CONTROL_REG, &reg_data);
@@ -1816,13 +2110,15 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
 
     // do we have any pending irq?
     if (0 == (irqs & (NTL_TSU_TS_IRQ_DELAY_REQ_RX_BIT |
-                          NTL_TSU_TS_IRQ_DELAY_REQ_TX_BIT |
-                          NTL_TSU_TS_IRQ_PDELAY_REQ_RX_BIT |
-                          NTL_TSU_TS_IRQ_PDELAY_REQ_TX_BIT |
-                          NTL_TSU_TS_IRQ_PDELAY_RESP_RX_BIT |
-                          NTL_TSU_TS_IRQ_PDELAY_RESP_TX_BIT |
-                          NTL_TSU_TS_IRQ_SYNC_RX_BIT |
-                          NTL_TSU_TS_IRQ_SYNC_TX_BIT)))
+                      NTL_TSU_TS_IRQ_DELAY_REQ_TX_BIT |
+                      NTL_TSU_TS_IRQ_PDELAY_REQ_RX_BIT |
+                      NTL_TSU_TS_IRQ_PDELAY_REQ_TX_BIT |
+                      NTL_TSU_TS_IRQ_PDELAY_RESP_RX_BIT |
+                      NTL_TSU_TS_IRQ_PDELAY_RESP_TX_BIT |
+                      NTL_TSU_TS_IRQ_SYNC_RX_BIT |
+                      NTL_TSU_TS_IRQ_SYNC_TX_BIT |
+                      NTL_TSU_TS_IRQ_NTP_RX_BIT |
+                      NTL_TSU_TS_IRQ_NTP_TX_BIT))) // we need to take NTP also into account
     {
         // end spinlock section
         spin_unlock_irqrestore(&(tsu->lock), flags);
@@ -1856,7 +2152,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_delay_req_rx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -1877,7 +2173,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_pdelay_req_rx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -1898,7 +2194,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_pdelay_resp_rx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -1919,11 +2215,37 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_sync_rx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
     }
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        if (0 != (irqs & NTL_TSU_TS_IRQ_NTP_RX_BIT))
+        {
+            delta_time_us = 0; // ensure at least one read
+            while ((0 < ntl_tsu_get_timestamp_and_meta_info(tsu, NTL_TSU_TS_STATUS_NTP_RX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_RX_BIT, NTL_TSU_NTP_RX_L_REG, NTL_TSU_NTP_RX_H_REG, &second, &nanosecond,
+                                                                 NTL_TSU_META_NTP_RX_0_REG, NTL_TSU_META_NTP_RX_1_REG, NTL_TSU_META_NTP_RX_2_REG, NTL_TSU_META_NTP_RX_3_REG, &meta_info_ts)) &&
+                   (delta_time_us < NTL_TSU_RX_TS_TIMEOUT_MICROSECOND))
+            {
+                // add to the front of the queue
+                ret = ntl_tsu_push_timestamp(tsu, &(tsu->data_queue_ntp_rx), &(tsu->data_queue_entry_count_ntp_rx), &meta_info_ts, &second, &nanosecond);
+
+                if (ret == 0)
+                {
+                    // wake up any sleeping process
+                    wake_up_interruptible(&(tsu->wait_queue_ntp_rx));
+                }
+
+                now_time = ktime_get();
+                delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+            }
+        }
+    }
+#endif
 #endif
 
 #ifdef NTL_TSU_IRQ_MODE_TX
@@ -1942,7 +2264,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_delay_req_tx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -1963,7 +2285,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_pdelay_req_tx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -1984,7 +2306,7 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_pdelay_resp_tx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
@@ -2005,11 +2327,37 @@ static irqreturn_t ntl_tsu_irq(int irq, void* dev)
                 // wake up any sleeping process
                 wake_up_interruptible(&(tsu->wait_queue_sync_tx));
             }
-            
+
             now_time = ktime_get();
             delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
         }
     }
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        if (0 != (irqs & NTL_TSU_TS_IRQ_NTP_TX_BIT))
+        {
+            delta_time_us = 0; // ensure at least one read
+            while ((0 < ntl_tsu_get_timestamp_and_meta_info(tsu, NTL_TSU_TS_STATUS_NTP_TX_ERROR_BIT, NTL_TSU_TS_STATUS_NTP_TX_BIT, NTL_TSU_NTP_TX_L_REG, NTL_TSU_NTP_TX_H_REG, &second, &nanosecond,
+                                                                 NTL_TSU_META_NTP_TX_0_REG, NTL_TSU_META_NTP_TX_1_REG, NTL_TSU_META_NTP_TX_2_REG, NTL_TSU_META_NTP_TX_3_REG, &meta_info_ts)) &&
+                   (delta_time_us < NTL_TSU_TX_TS_TIMEOUT_MICROSECOND))
+            {
+                // add to the front of the queue
+                ret = ntl_tsu_push_timestamp(tsu, &(tsu->data_queue_ntp_tx), &(tsu->data_queue_entry_count_ntp_tx), &meta_info_ts, &second, &nanosecond);
+
+                if (ret == 0)
+                {
+                    // wake up any sleeping process
+                    wake_up_interruptible(&(tsu->wait_queue_ntp_tx));
+                }
+
+                now_time = ktime_get();
+                delta_time_us = ktime_to_us(ktime_sub(now_time, start_time));
+            }
+        }
+    }
+#endif
 #endif
 
     // end spinlock section
@@ -2070,7 +2418,7 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
         goto err_platform_get_resource_mem_failed;
     }
 
-    printk(KERN_ERR "%s ctrl_mem@0x%08X - 0x%08X\n", NTL_TSU_DRIVER_NAME, mem->start, (mem->start + NTL_TSU_REGSET_SIZE -1));
+    printk(KERN_ERR "%s ctrl_mem@0x%016llX - 0x%016llX\n", NTL_TSU_DRIVER_NAME, (unsigned long long)mem->start, (unsigned long long)(mem->start + NTL_TSU_REGSET_SIZE -1));
 
     // save physical address
     tsu->physical_ctrl_base = mem->start;
@@ -2094,14 +2442,42 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
 
     // read version register
     ntl_tsu_read_reg(tsu, NTL_TSU_VERSION_REG, &reg_data);
-    
+
     // check if something expected is here, these are the ones we definitely do not expect
-    if ((reg_data == 0x00000000) || (reg_data == 0xDEADDEAD)) 
+    if ((reg_data == 0x00000000) || (reg_data == 0xDEADDEAD))
     {
         NTL_TSU_DPRINTK(NTL_TSU_ERROR_LEVEL, "unexpected version received (not our core?): 0x%08X\n", reg_data);
         ret = -EINVAL;
         goto err_our_device_failed;
     }
+
+#ifdef NTL_TSU_NTP_SUPPORT
+    // start spinlock section
+    spin_lock_irqsave(&(tsu->lock), flags);
+
+    // clear errors first
+    reg_data = NTL_TSU_STATUS_TIME_INVALID_BIT | NTL_TSU_STATUS_TIME_JUMP_BIT;
+
+    // write status register
+    ntl_tsu_write_reg(tsu, NTL_TSU_STATUS_REG, &reg_data);
+
+    // read status register
+    ntl_tsu_read_reg(tsu, NTL_TSU_STATUS_REG, &reg_data);
+    if ((reg_data & NTL_TSU_STATUS_NTP_SUPPORT_BIT) != 0)
+    {
+        NTL_TSU_DPRINTK(NTL_TSU_ERROR_LEVEL, "NTP support available\n");
+        tsu->ntp_support = 1;
+    }
+    else
+    {
+        NTL_TSU_DPRINTK(NTL_TSU_ERROR_LEVEL, "no NTP support available\n");
+        tsu->ntp_support = 0;
+    }
+
+    // end spinlock section
+    spin_unlock_irqrestore(&(tsu->lock), flags);
+#endif
+
 
 #ifdef NTL_TSU_META_INFO
     // start spinlock section
@@ -2138,16 +2514,26 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
     INIT_LIST_HEAD(&(tsu->data_queue_pdelay_resp_tx));
     INIT_LIST_HEAD(&(tsu->data_queue_sync_rx));
     INIT_LIST_HEAD(&(tsu->data_queue_sync_tx));
+#ifdef NTL_TSU_NTP_SUPPORT
+    INIT_LIST_HEAD(&(tsu->data_queue_ntp_rx));
+    INIT_LIST_HEAD(&(tsu->data_queue_ntp_tx));
+#endif
 
     // set to empty
     atomic_set(&(tsu->data_queue_entry_count_delay_req_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_req_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_sync_rx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+    atomic_set(&(tsu->data_queue_entry_count_ntp_rx), 0);
+#endif
     atomic_set(&(tsu->data_queue_entry_count_delay_req_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_req_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_sync_tx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+    atomic_set(&(tsu->data_queue_entry_count_ntp_tx), 0);
+#endif
 
 #endif
 
@@ -2166,7 +2552,7 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
             goto err_platform_get_resource_irq_failed;
         }
 
-        printk(KERN_ERR "%s irq@0x%08X\n", NTL_TSU_DRIVER_NAME, irq->start);
+        printk(KERN_ERR "%s irq@0x%016llX\n", NTL_TSU_DRIVER_NAME, (unsigned long long)irq->start);
 
         // save irq number
         tsu->irq = irq->start;
@@ -2187,12 +2573,19 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
         init_waitqueue_head(&(tsu->wait_queue_pdelay_req_rx));
         init_waitqueue_head(&(tsu->wait_queue_pdelay_resp_rx));
         init_waitqueue_head(&(tsu->wait_queue_sync_rx));
+#ifdef NTL_TSU_NTP_SUPPORT
+        init_waitqueue_head(&(tsu->wait_queue_ntp_rx));
 #endif
+#endif
+
 #ifdef NTL_TSU_IRQ_MODE_TX
         init_waitqueue_head(&(tsu->wait_queue_delay_req_tx));
         init_waitqueue_head(&(tsu->wait_queue_pdelay_req_tx));
         init_waitqueue_head(&(tsu->wait_queue_pdelay_resp_tx));
         init_waitqueue_head(&(tsu->wait_queue_sync_tx));
+#ifdef NTL_TSU_NTP_SUPPORT
+        init_waitqueue_head(&(tsu->wait_queue_ntp_tx));
+#endif
 #endif
     }
 #endif
@@ -2220,6 +2613,12 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
                     NTL_TSU_TS_IRQMASK_PDELAY_REQ_RX_BIT |
                     NTL_TSU_TS_IRQMASK_PDELAY_RESP_RX_BIT |
                     NTL_TSU_TS_IRQMASK_SYNC_RX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_IRQMASK_NTP_RX_BIT;
+    }
+#endif
 #endif
 
 #ifdef NTL_TSU_IRQ_MODE_TX
@@ -2228,6 +2627,12 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
                     NTL_TSU_TS_IRQMASK_PDELAY_REQ_TX_BIT |
                     NTL_TSU_TS_IRQMASK_PDELAY_RESP_TX_BIT |
                     NTL_TSU_TS_IRQMASK_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_IRQMASK_NTP_TX_BIT;
+    }
+#endif
 #endif
     }
     else
@@ -2260,6 +2665,12 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
                NTL_TSU_TS_STATUS_PDELAY_RESP_TX_ERROR_BIT |
                NTL_TSU_TS_STATUS_SYNC_RX_ERROR_BIT |
                NTL_TSU_TS_STATUS_SYNC_TX_ERROR_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+        reg_data |= NTL_TSU_TS_STATUS_NTP_RX_BIT |
+                    NTL_TSU_TS_STATUS_NTP_TX_BIT |
+                    NTL_TSU_TS_STATUS_NTP_RX_ERROR_BIT |
+                    NTL_TSU_TS_STATUS_NTP_TX_ERROR_BIT;
+#endif
 
     // write ts status register
     ntl_tsu_write_reg(tsu, NTL_TSU_TS_STATUS_REG, &reg_data);
@@ -2273,6 +2684,10 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
                NTL_TSU_TS_IRQ_PDELAY_RESP_TX_BIT |
                NTL_TSU_TS_IRQ_SYNC_RX_BIT |
                NTL_TSU_TS_IRQ_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+        reg_data |= NTL_TSU_TS_IRQ_NTP_RX_BIT |
+                    NTL_TSU_TS_IRQ_NTP_TX_BIT;
+#endif
 
     // write irq register
     ntl_tsu_write_reg(tsu, NTL_TSU_TS_IRQ_REG, &reg_data);
@@ -2286,7 +2701,13 @@ int ntl_tsu_probe(struct ntl_tsu* tsu, struct platform_device *pdev)
                NTL_TSU_TS_CONTROL_PDELAY_RESP_TX_BIT |
                NTL_TSU_TS_CONTROL_SYNC_RX_BIT |
                NTL_TSU_TS_CONTROL_SYNC_TX_BIT;
-
+#ifdef NTL_TSU_NTP_SUPPORT
+    if (tsu->ntp_support != 0)
+    {
+        reg_data |= NTL_TSU_TS_CONTROL_NTP_RX_BIT |
+                    NTL_TSU_TS_CONTROL_NTP_TX_BIT;
+    }
+#endif
 
     // write ts control register
     ntl_tsu_write_reg(tsu, NTL_TSU_TS_CONTROL_REG, &reg_data);
@@ -2370,6 +2791,12 @@ int ntl_tsu_remove(struct ntl_tsu* tsu, struct platform_device *pdev)
     // write register
     ntl_tsu_write_reg(tsu, NTL_TSU_CONTROL_REG, &reg_data);
 
+    // disable all TS
+    reg_data = 0;
+
+    // write ts control register
+    ntl_tsu_write_reg(tsu, NTL_TSU_TS_CONTROL_REG, &reg_data);
+
     // set diabled
     atomic_set(&tsu->enable, 0);
 
@@ -2391,6 +2818,10 @@ int ntl_tsu_remove(struct ntl_tsu* tsu, struct platform_device *pdev)
                    NTL_TSU_TS_IRQ_PDELAY_RESP_TX_BIT |
                    NTL_TSU_TS_IRQ_SYNC_RX_BIT |
                    NTL_TSU_TS_IRQ_SYNC_TX_BIT;
+#ifdef NTL_TSU_NTP_SUPPORT
+        reg_data |= NTL_TSU_TS_IRQ_NTP_RX_BIT |
+                    NTL_TSU_TS_IRQ_NTP_TX_BIT;
+#endif
 
         // write irq register
         ntl_tsu_write_reg(tsu, NTL_TSU_TS_IRQ_REG, &reg_data);
@@ -2447,16 +2878,36 @@ int ntl_tsu_remove(struct ntl_tsu* tsu, struct platform_device *pdev)
         list_del(tsu->data_queue_sync_tx.next);
         kfree(timestamp);
     }
+#ifdef NTL_TSU_NTP_SUPPORT
+    while (0 == list_empty(&(tsu->data_queue_ntp_rx)))
+    {
+        timestamp = list_entry(tsu->data_queue_ntp_rx.next, struct ntl_tsu_timestamp_list, list);
+        list_del(tsu->data_queue_ntp_rx.next);
+        kfree(timestamp);
+    }
+    while (0 == list_empty(&(tsu->data_queue_ntp_tx)))
+    {
+        timestamp = list_entry(tsu->data_queue_ntp_tx.next, struct ntl_tsu_timestamp_list, list);
+        list_del(tsu->data_queue_ntp_tx.next);
+        kfree(timestamp);
+    }
+#endif
 
     // set to empty
     atomic_set(&(tsu->data_queue_entry_count_delay_req_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_req_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_rx), 0);
     atomic_set(&(tsu->data_queue_entry_count_sync_rx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+    atomic_set(&(tsu->data_queue_entry_count_ntp_rx), 0);
+#endif
     atomic_set(&(tsu->data_queue_entry_count_delay_req_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_req_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_pdelay_resp_tx), 0);
     atomic_set(&(tsu->data_queue_entry_count_sync_tx), 0);
+#ifdef NTL_TSU_NTP_SUPPORT
+    atomic_set(&(tsu->data_queue_entry_count_ntp_tx), 0);
+#endif
 
 #endif
 

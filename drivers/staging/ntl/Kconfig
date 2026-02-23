@@ -1,2 +1,6 @@
-source "drivers/staging/ntl/ntl_macb/Kconfig"
 source "drivers/staging/ntl/ntl_phc/Kconfig"
+source "drivers/staging/ntl/ntl_macb/Kconfig"
+source "drivers/staging/ntl/ntl_sts/Kconfig"
+source "drivers/staging/ntl/ntl_sgn/Kconfig"
+source "drivers/staging/ntl/ntl_fgn/Kconfig"
+source "drivers/staging/ntl/ntl_cts/Kconfig"

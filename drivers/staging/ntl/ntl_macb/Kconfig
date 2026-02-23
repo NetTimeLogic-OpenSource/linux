@@ -3,7 +3,7 @@
 #
 
 config NTL_MACB
-	tristate "Cadence MACB/GEM support (NTL version)"
+	tristate "Cadence MACB/GEM support"
 	depends on HAS_DMA
 	select PHYLIB
 	help

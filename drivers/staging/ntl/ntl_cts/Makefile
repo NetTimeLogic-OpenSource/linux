@@ -1,0 +1,1 @@
+obj-$(CONFIG_NTL_CTS) += ntl_cts.o

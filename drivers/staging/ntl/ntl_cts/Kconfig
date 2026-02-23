@@ -1,0 +1,6 @@
+config NTL_CTS
+	bool "NetTimeLogic CTS devices"
+	depends on HAS_IOMEM
+	default y
+	help
+	  If you have a Cross Timestamper IP in the PL.

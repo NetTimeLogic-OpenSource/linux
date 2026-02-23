@@ -1,0 +1,10 @@
+#
+# NetTimeLogic SGN device configuration
+#
+
+config NTL_SGN
+	bool "NetTimeLogic SGN devices"
+	depends on HAS_IOMEM
+	default y
+	help
+	  If you have a Signal Generator IP in the PL.

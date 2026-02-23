@@ -1,0 +1,10 @@
+#
+# NetTimeLogic FGN device configuration
+#
+
+config NTL_FGN
+	bool "NetTimeLogic FGN devices"
+	depends on HAS_IOMEM
+	default y
+	help
+	  If you have a Frequency Generator IP in the PL.
